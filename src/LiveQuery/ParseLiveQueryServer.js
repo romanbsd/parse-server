@@ -8,7 +8,7 @@ import RequestSchema from './RequestSchema';
 import { matchesQuery, queryHash } from './QueryTools';
 import { ParsePubSub } from './ParsePubSub';
 import { SessionTokenCache } from './SessionTokenCache';
-import _ from 'lodash';
+import entries from 'lodash/toPairs';
 import uuid from 'uuid';
 import { runLiveQueryEventHandlers } from '../triggers';
 
@@ -17,7 +17,7 @@ class ParseLiveQueryServer {
   // className -> (queryHash -> subscription)
   subscriptions: Object;
   parseWebSocketServer: Object;
-  keyPairs : any;
+  keyPairs: any;
   // The subscriber we use to get object update from publisher
   subscriber: Object;
 
@@ -101,6 +101,16 @@ class ParseLiveQueryServer {
     }
   }
 
+  _findSubscriptions(object: any): any {
+    const className = object.className;
+    const classSubscriptions = this.subscriptions.get(className);
+    if (typeof classSubscriptions === 'undefined') {
+      logger.debug('Can not find subscriptions under this class ' + className);
+      return [];
+    }
+    return classSubscriptions.values();
+  }
+
   // Message is the JSON object from publisher after inflated. Message.currentParseObject is the ParseObject after changes.
   // Message.originalParseObject is the original ParseObject.
   _onAfterDelete(message: any): void {
@@ -111,17 +121,13 @@ class ParseLiveQueryServer {
     logger.verbose('ClassName: %j | ObjectId: %s', className, deletedParseObject.id);
     logger.verbose('Current client number : %d', this.clients.size);
 
-    const classSubscriptions = this.subscriptions.get(className);
-    if (typeof classSubscriptions === 'undefined') {
-      logger.debug('Can not find subscriptions under this class ' + className);
-      return;
-    }
-    for (const subscription of classSubscriptions.values()) {
+    const allSubscriptions = this._findSubscriptions(deletedParseObject);
+    for (const subscription of allSubscriptions) {
       const isSubscriptionMatched = this._matchesSubscription(deletedParseObject, subscription);
       if (!isSubscriptionMatched) {
         continue;
       }
-      for (const [clientId, requestIds] of _.entries(subscription.clientRequestIds)) {
+      for (const [clientId, requestIds] of entries(subscription.clientRequestIds)) {
         const client = this.clients.get(clientId);
         if (typeof client === 'undefined') {
           continue;
@@ -156,79 +162,80 @@ class ParseLiveQueryServer {
     logger.verbose('ClassName: %s | ObjectId: %s', className, currentParseObject.id);
     logger.verbose('Current client number : %d', this.clients.size);
 
-    const classSubscriptions = this.subscriptions.get(className);
-    if (typeof classSubscriptions === 'undefined') {
-      logger.debug('Can not find subscriptions under this class ' + className);
-      return;
-    }
-    for (const subscription of classSubscriptions.values()) {
-      const isOriginalSubscriptionMatched = this._matchesSubscription(originalParseObject, subscription);
-      const isCurrentSubscriptionMatched = this._matchesSubscription(currentParseObject, subscription);
-      for (const [clientId, requestIds] of _.entries(subscription.clientRequestIds)) {
-        const client = this.clients.get(clientId);
-        if (typeof client === 'undefined') {
-          continue;
-        }
-        for (const requestId of requestIds) {
-          // Set orignal ParseObject ACL checking promise, if the object does not match
-          // subscription, we do not need to check ACL
-          let originalACLCheckingPromise;
-          if (!isOriginalSubscriptionMatched) {
-            originalACLCheckingPromise = Parse.Promise.as(false);
-          } else {
-            let originalACL;
-            if (message.originalParseObject) {
-              originalACL = message.originalParseObject.getACL();
-            }
-            originalACLCheckingPromise = this._matchesACL(originalACL, client, requestId);
+    [originalParseObject, currentParseObject].forEach((object) => {
+      if (!object) {
+        return;
+      }
+      const allSubscriptions = this._findSubscriptions(object);
+      for (const subscription of allSubscriptions) {
+        const isOriginalSubscriptionMatched = this._matchesSubscription(originalParseObject, subscription);
+        const isCurrentSubscriptionMatched = this._matchesSubscription(currentParseObject, subscription);
+        for (const [clientId, requestIds] of entries(subscription.clientRequestIds)) {
+          const client = this.clients.get(clientId);
+          if (typeof client === 'undefined') {
+            continue;
           }
-          // Set current ParseObject ACL checking promise, if the object does not match
-          // subscription, we do not need to check ACL
-          let currentACLCheckingPromise;
-          if (!isCurrentSubscriptionMatched) {
-            currentACLCheckingPromise = Parse.Promise.as(false);
-          } else {
-            const currentACL = message.currentParseObject.getACL();
-            currentACLCheckingPromise = this._matchesACL(currentACL, client, requestId);
-          }
-
-          Parse.Promise.when(
-            originalACLCheckingPromise,
-            currentACLCheckingPromise
-          ).then((isOriginalMatched, isCurrentMatched) => {
-            logger.verbose('Original %j | Current %j | Match: %s, %s, %s, %s | Query: %s',
-              originalParseObject,
-              currentParseObject,
-              isOriginalSubscriptionMatched,
-              isCurrentSubscriptionMatched,
-              isOriginalMatched,
-              isCurrentMatched,
-              subscription.hash
-            );
-
-            // Decide event type
-            let type;
-            if (isOriginalMatched && isCurrentMatched) {
-              type = 'Update';
-            } else if (isOriginalMatched && !isCurrentMatched) {
-              type = 'Leave';
-            } else if (!isOriginalMatched && isCurrentMatched) {
-              if (originalParseObject) {
-                type = 'Enter';
-              } else {
-                type = 'Create';
-              }
+          for (const requestId of requestIds) {
+            // Set orignal ParseObject ACL checking promise, if the object does not match
+            // subscription, we do not need to check ACL
+            let originalACLCheckingPromise;
+            if (!isOriginalSubscriptionMatched) {
+              originalACLCheckingPromise = Parse.Promise.as(false);
             } else {
-              return null;
+              let originalACL;
+              if (message.originalParseObject) {
+                originalACL = message.originalParseObject.getACL();
+              }
+              originalACLCheckingPromise = this._matchesACL(originalACL, client, requestId);
             }
-            const functionName = 'push' + type;
-            client[functionName](requestId, currentParseObject);
-          }, (error) => {
-            logger.error('Matching ACL error : ', error);
-          });
+            // Set current ParseObject ACL checking promise, if the object does not match
+            // subscription, we do not need to check ACL
+            let currentACLCheckingPromise;
+            if (!isCurrentSubscriptionMatched) {
+              currentACLCheckingPromise = Parse.Promise.as(false);
+            } else {
+              const currentACL = message.currentParseObject.getACL();
+              currentACLCheckingPromise = this._matchesACL(currentACL, client, requestId);
+            }
+
+            Parse.Promise.when(
+              originalACLCheckingPromise,
+              currentACLCheckingPromise
+            ).then((isOriginalMatched, isCurrentMatched) => {
+              logger.verbose('Original %j | Current %j | Match: %s, %s, %s, %s | Query: %s',
+                originalParseObject,
+                currentParseObject,
+                isOriginalSubscriptionMatched,
+                isCurrentSubscriptionMatched,
+                isOriginalMatched,
+                isCurrentMatched,
+                subscription.hash
+              );
+
+              // Decide event type
+              let type;
+              if (isOriginalMatched && isCurrentMatched) {
+                type = 'Update';
+              } else if (isOriginalMatched && !isCurrentMatched) {
+                type = 'Leave';
+              } else if (!isOriginalMatched && isCurrentMatched) {
+                if (originalParseObject) {
+                  type = 'Enter';
+                } else {
+                  type = 'Create';
+                }
+              } else {
+                return null;
+              }
+              const functionName = 'push' + type;
+              client[functionName](requestId, currentParseObject);
+            }, (error) => {
+              logger.error('Matching ACL error : ', error);
+            });
+          }
         }
       }
-    }
+    });
   }
 
   _onConnect(parseWebsocket: any): void {
@@ -236,7 +243,7 @@ class ParseLiveQueryServer {
       if (typeof request === 'string') {
         try {
           request = JSON.parse(request);
-        } catch(e) {
+        } catch (e) {
           logger.error('unable to parse request', request, e);
           return;
         }
@@ -250,7 +257,7 @@ class ParseLiveQueryServer {
         return;
       }
 
-      switch(request.op) {
+      switch (request.op) {
       case 'connect':
         this._handleConnect(parseWebsocket, request);
         break;
@@ -288,7 +295,7 @@ class ParseLiveQueryServer {
       this.clients.delete(clientId);
 
       // Delete client from subscriptions
-      for (const [requestId, subscriptionInfo] of _.entries(client.subscriptionInfos)) {
+      for (const [requestId, subscriptionInfo] of entries(client.subscriptionInfos)) {
         const subscription = subscriptionInfo.subscription;
         subscription.deleteClientSubscription(clientId, requestId);
 
@@ -380,10 +387,9 @@ class ParseLiveQueryServer {
             // Then get the user's roles
             var rolesQuery = new Parse.Query(Parse.Role);
             rolesQuery.equalTo("users", user);
-            return rolesQuery.find({useMasterKey:true});
+            return rolesQuery.find({useMasterKey: true});
           }).
           then((roles) => {
-
             // Finally, see if any of the user's roles allow them read access
             for (const role of roles) {
               if (acl.getRoleReadAccess(role)) {
@@ -399,7 +405,7 @@ class ParseLiveQueryServer {
       });
     }).then((isRoleMatched) => {
 
-      if(isRoleMatched) {
+      if (isRoleMatched) {
         return Parse.Promise.as(true);
       }
 
@@ -436,11 +442,11 @@ class ParseLiveQueryServer {
   }
 
   _hasMasterKey(request: any, validKeyPairs: any): boolean {
-    if(!validKeyPairs || validKeyPairs.size == 0 ||
+    if (!validKeyPairs || validKeyPairs.size == 0 ||
       !validKeyPairs.has("masterKey")) {
       return false;
     }
-    if(!request || !request.hasOwnProperty("masterKey")) {
+    if (!request || !request.hasOwnProperty("masterKey")) {
       return false;
     }
     return request.masterKey === validKeyPairs.get("masterKey");
@@ -528,7 +534,7 @@ class ParseLiveQueryServer {
     const requestId = request.requestId;
     const client = this.clients.get(parseWebsocket.clientId);
     if (typeof client === 'undefined') {
-      Client.pushError(parseWebsocket, 2, 'Cannot find client with clientId '  + parseWebsocket.clientId +
+      Client.pushError(parseWebsocket, 2, 'Cannot find client with clientId ' + parseWebsocket.clientId +
         '. Make sure you connect to live query server before unsubscribing.');
       logger.error('Can not find this client ' + parseWebsocket.clientId);
       return;
@@ -536,9 +542,9 @@ class ParseLiveQueryServer {
 
     const subscriptionInfo = client.getSubscriptionInfo(requestId);
     if (typeof subscriptionInfo === 'undefined') {
-      Client.pushError(parseWebsocket, 2, 'Cannot find subscription with clientId '  + parseWebsocket.clientId +
+      Client.pushError(parseWebsocket, 2, 'Cannot find subscription with clientId ' + parseWebsocket.clientId +
         ' subscriptionId ' + requestId + '. Make sure you subscribe to live query server before unsubscribing.');
-      logger.error('Can not find subscription with clientId ' + parseWebsocket.clientId +  ' subscriptionId ' + requestId);
+      logger.error('Can not find subscription with clientId ' + parseWebsocket.clientId + ' subscriptionId ' + requestId);
       return;
     }
 
