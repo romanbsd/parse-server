@@ -5,7 +5,7 @@ import { Client } from './Client';
 import { ParseWebSocketServer } from './ParseWebSocketServer';
 import logger from '../logger';
 import RequestSchema from './RequestSchema';
-import { matchesQuery, queryHash } from './QueryTools';
+import { matchesQuery, queryHash, isSimpleQuery } from './QueryTools';
 import { ParsePubSub } from './ParsePubSub';
 import { SessionTokenCache } from './SessionTokenCache';
 import entries from 'lodash/toPairs';
@@ -101,6 +101,15 @@ class ParseLiveQueryServer {
     }
   }
 
+  _keyVal(query: any): any {
+    const field = Object.keys(query.where)[0];
+    let val = query[field];
+    if (typeof val === 'object') {
+      val = val.objectId;
+    }
+    return [field, val];
+  }
+
   _findSubscriptions(object: any): any {
     const className = object.className;
     const classSubscriptions = this.subscriptions.get(className);
@@ -108,6 +117,16 @@ class ParseLiveQueryServer {
       logger.debug('Can not find subscriptions under this class ' + className);
       return [];
     }
+    classSubscriptions.byQuery.forEach((values, field) => {
+      let val = object[field];
+      if (typeof val === 'object') {
+        val = val.objectId;
+      }
+      if (typeof val !== 'undefined' && values.has(val)) {
+        return values.get(val).values();
+      }
+    });
+    // Fallback to the regular search
     return classSubscriptions.values();
   }
 
@@ -301,6 +320,20 @@ class ParseLiveQueryServer {
 
         // If there is no client which is subscribing this subscription, remove it from subscriptions
         const classSubscriptions = this.subscriptions.get(subscription.className);
+        const query = subscription.query;
+        if (isSimpleQuery(query)) {
+          const [field, val] = this._keyVal(query);
+          const byQuery = classSubscriptions.byQuery;
+          const simpleQuerySubscriptions = byQuery.get(field);
+          const subscriptions = simpleQuerySubscriptions.get(val);
+          subscriptions.delete(queryHash(query));
+          if (subscriptions.size === 0) {
+            simpleQuerySubscriptions.delete(val);
+            if (simpleQuerySubscriptions.size === 0) {
+              byQuery.delete(field);
+            }
+          }
+        }
         if (!subscription.hasSubscribingClient()) {
           classSubscriptions.delete(subscription.hash);
         }
@@ -476,29 +509,54 @@ class ParseLiveQueryServer {
     }
     const client = this.clients.get(parseWebsocket.clientId);
 
+    const query = request.query;
     // Get subscription from subscriptions, create one if necessary
-    const subscriptionHash = queryHash(request.query);
+    const subscriptionHash = queryHash(query);
     // Add className to subscriptions if necessary
-    const className = request.query.className;
+    const className = query.className;
+    let classSubscriptions;
     if (!this.subscriptions.has(className)) {
-      this.subscriptions.set(className, new Map());
-    }
-    const classSubscriptions = this.subscriptions.get(className);
-    let subscription;
-    if (classSubscriptions.has(subscriptionHash)) {
-      subscription = classSubscriptions.get(subscriptionHash);
+      classSubscriptions = new Map();
+      classSubscriptions.byQuery = new Map();
+      this.subscriptions.set(className, classSubscriptions);
     } else {
-      subscription = new Subscription(className, request.query.where, subscriptionHash);
-      classSubscriptions.set(subscriptionHash, subscription);
+      classSubscriptions = this.subscriptions.get(className);
     }
+
+    function findOrCreateSubscription(classSubscriptions) {
+      if (classSubscriptions.has(subscriptionHash)) {
+        subscription = classSubscriptions.get(subscriptionHash);
+      } else {
+        subscription = new Subscription(className, query.where, subscriptionHash);
+        classSubscriptions.set(subscriptionHash, subscription);
+      }
+      return subscription;
+    }
+
+    // By simple query, e.g. "objectId":"..."
+    let subscription;
+    if (isSimpleQuery(query)) {
+      logger.verbose('Simple query %j', query);
+      const [field, val] = this._keyVal(query);
+      const byQuery = classSubscriptions.byQuery;
+      if (!byQuery.has(field)) {
+        byQuery.set(field, new Map());
+      }
+      const simpleQuerySubscriptions = byQuery.get(field);
+      if (!simpleQuerySubscriptions.has(val)) {
+        simpleQuerySubscriptions.set(val, new Map());
+      }
+      findOrCreateSubscription(simpleQuerySubscriptions.get(val));
+    }
+    subscription = findOrCreateSubscription(classSubscriptions);
 
     // Add subscriptionInfo to client
     const subscriptionInfo = {
       subscription: subscription
     };
     // Add selected fields and sessionToken for this subscription if necessary
-    if (request.query.fields) {
-      subscriptionInfo.fields = request.query.fields;
+    if (query.fields) {
+      subscriptionInfo.fields = query.fields;
     }
     if (request.sessionToken) {
       subscriptionInfo.sessionToken = request.sessionToken;
@@ -558,6 +616,10 @@ class ParseLiveQueryServer {
     const classSubscriptions = this.subscriptions.get(className);
     if (!subscription.hasSubscribingClient()) {
       classSubscriptions.delete(subscription.hash);
+      if (isSimpleQuery(subscription.query)) {
+        const [field, val] = this._keyVal(subscription.query);
+        classSubscriptions.byQuery.get(field).get(val).delete(subscription);
+      }
     }
     // If there is no subscriptions under this class, remove it from subscriptions
     if (classSubscriptions.size === 0) {

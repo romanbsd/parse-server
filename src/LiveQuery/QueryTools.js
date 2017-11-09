@@ -1,6 +1,7 @@
 var equalObjects = require('./equalObjects');
 var Id = require('./Id');
 var Parse = require('parse/node');
+const size = require('lodash/size');
 
 /**
  * Query Hashes are deterministic hashes for Parse Queries.
@@ -323,7 +324,19 @@ function matchesKeyConstraints(object, key, constraints) {
   return true;
 }
 
+function isSimpleQuery(query) {
+  if (!query) {
+    return false;
+  }
+  const where = query.where;
+  if (!where || size(where) !== 1 || where.hasOwnProperty('$or')) {
+    return false;
+  }
+  return true;
+}
+
 var QueryTools = {
+  isSimpleQuery: isSimpleQuery,
   queryHash: queryHash,
   matchesQuery: matchesQuery
 };
